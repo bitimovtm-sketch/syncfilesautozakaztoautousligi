@@ -143,9 +143,26 @@ def extract_filename(resp, fallback='file.bin'):
     return fallback
 
 
+def _normalize_file_url(url):
+    """
+    Workaround for Bitrix24 webhook-context urlMachine: sometimes it comes back
+    as ".../crm.controller.item.getFile/?token=..." (trailing slash, no extension)
+    and 404s. The working form is ".../crm.controller.item.getFile.json?token=...".
+    Add .json before the query string if it's missing.
+    """
+    if not url:
+        return url
+    path, sep, query = url.partition('?')
+    path_stripped = path.rstrip('/')
+    if not path_stripped.endswith('.json'):
+        path_stripped += '.json'
+    return path_stripped + sep + query
+
+
 def download(url):
     """Download file by its urlMachine. Returns (filename, base64_str)."""
     _throttle()  # file downloads also hit the portal — keep them in the same budget
+    url = _normalize_file_url(url)
     r = requests.get(url, timeout=55, allow_redirects=True)
     r.raise_for_status()
     return extract_filename(r), base64.b64encode(r.content).decode('ascii')
