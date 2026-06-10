@@ -143,43 +143,55 @@ def extract_filename(resp, fallback='file.bin'):
     return fallback
 
 
-def _build_download_url(url_machine):
+def _try_disk_download(webhook, file_id):
     """
-    Bitrix24's webhook-context urlMachine comes back like:
-      https://portal.bitrix24.ru/rest/USER_ID/WH_TOKEN/crm.controller.item.getFile/?token=...
-    That path 404s — crm.controller.item.getFile isn't routable via webhook prefix.
-    The working form (per docs example) is OAuth-style:
-      https://portal.bitrix24.ru/rest/crm.controller.item.getFile.json?auth=...&token=...
-    Webhook token works as the auth= parameter for these controllers.
+    Try to get the file via disk.file.get + DOWNLOAD_URL.
+    Returns (filename, base64_str) on success, None if file isn't on the disk.
     """
-    if not url_machine:
-        return url_machine
-    m = re.match(r'(https?://[^/]+)/rest/(\d+)/([A-Za-z0-9]+)/(.+)$', url_machine)
-    if not m:
-        # Already OAuth-style or unrecognized — return as-is
-        return url_machine
-    origin, _user_id, wh_token, rest = m.groups()
-    path, sep, query = rest.partition('?')
-    path = path.rstrip('/')
-    if not path.endswith('.json'):
-        path += '.json'
-    new_query = f'auth={wh_token}'
-    if query:
-        new_query = f'{new_query}&{query}'
-    return f'{origin}/rest/{path}?{new_query}'
-
-
-def download(url):
-    """Download file by its urlMachine. Returns (filename, base64_str)."""
-    _throttle()  # file downloads also hit the portal — keep them in the same budget
-    final_url = _build_download_url(url)
-    log.info('GET %s', final_url)
-    r = requests.get(final_url, timeout=55, allow_redirects=True)
+    try:
+        info = bx(webhook, 'disk.file.get', {'id': int(file_id)})
+    except RuntimeError as e:
+        log.info('disk.file.get failed for id=%s: %s', file_id, e)
+        return None
+    if not info or not isinstance(info, dict):
+        return None
+    dl_url = info.get('DOWNLOAD_URL') or info.get('downloadUrl')
+    if not dl_url:
+        log.info('disk.file.get returned no DOWNLOAD_URL for id=%s; keys=%s', file_id, list(info.keys()))
+        return None
+    name = info.get('NAME') or info.get('name') or f'file_{file_id}.bin'
+    log.info('disk.file.get OK for id=%s, name=%s, downloading...', file_id, name)
+    _throttle()
+    r = requests.get(dl_url, timeout=55, allow_redirects=True)
     if not r.ok:
-        log.warning(
-            'download HTTP %s; body[:400]=%r',
-            r.status_code, r.text[:400] if r.text else '',
-        )
+        log.warning('disk DOWNLOAD_URL HTTP %s; body[:300]=%r', r.status_code, r.text[:300] if r.text else '')
+        return None
+    return name, base64.b64encode(r.content).decode('ascii')
+
+
+def download_file(p1_webhook, file_meta):
+    """
+    Download a single file. file_meta is the dict Bitrix returned: {id, url, urlMachine}.
+    Tries disk.file.get first (works via webhook), falls back to urlMachine GET.
+    Raises on total failure so the calling code knows this field couldn't be synced.
+    """
+    file_id = file_meta.get('id')
+
+    # Primary path: disk.file.get works fine via webhook
+    if file_id:
+        result = _try_disk_download(p1_webhook, file_id)
+        if result is not None:
+            return result
+
+    # Fallback: original urlMachine (will probably 404/401 in webhook context, but log it)
+    url_machine = file_meta.get('urlMachine') or file_meta.get('url')
+    if not url_machine:
+        raise RuntimeError(f'no download URL and disk.file.get failed for file {file_id}')
+    log.info('disk path failed, falling back to urlMachine: %s', url_machine)
+    _throttle()
+    r = requests.get(url_machine, timeout=55, allow_redirects=True)
+    if not r.ok:
+        log.warning('urlMachine fallback HTTP %s; body[:300]=%r', r.status_code, r.text[:300] if r.text else '')
         r.raise_for_status()
     return extract_filename(r), base64.b64encode(r.content).decode('ascii')
 
@@ -197,9 +209,8 @@ def build_update_payload(deal_p1):
             continue
         prepared = []
         for f in files:
-            url = f.get('urlMachine') or f.get('url')
-            log.info('Downloading file id=%s from portal 1', f.get('id'))
-            name, b64 = download(url)
+            log.info('Resolving file id=%s for field %s', f.get('id'), p1c)
+            name, b64 = download_file(PORTAL_1_WEBHOOK, f)
             prepared.append([name, b64])
         fields[p2c] = prepared
     return fields
