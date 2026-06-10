@@ -310,6 +310,27 @@ def _note(msg, **inc):
         _stats['last_event_msg'] = msg
 
 
+# Delayed re-sync budget for deals with partially failed downloads.
+# A freshly uploaded file can 404 for a short while; we re-run the whole
+# deal sync after a delay, but at most twice, so a genuinely broken file
+# doesn't cause an endless loop.
+_retry_lock = threading.Lock()
+_retry_counts = {}  # deal_id -> delayed retries used
+
+
+def _schedule_resync(deal_id):
+    with _retry_lock:
+        n = _retry_counts.get(deal_id, 0)
+        if n >= 2:
+            log.error('deal %s: giving up on failed fields after %s delayed retries. '
+                      'Check the file(s) on portal 1 — they may be broken.', deal_id, n)
+            _retry_counts.pop(deal_id, None)
+            return
+        _retry_counts[deal_id] = n + 1
+    log.info('scheduling re-sync of deal %s in 60s (delayed attempt %s/2)', deal_id, n + 1)
+    threading.Timer(60, enqueue, args=(deal_id,)).start()
+
+
 def do_sync(deal_id):
     try:
         log.info('=== sync start P1 deal=%s ===', deal_id)
@@ -329,13 +350,17 @@ def do_sync(deal_id):
         fields, failed = build_update_payload(deal)
 
         # Retry failed fields once with a FRESH crm.item.get:
-        # urlMachine tokens can go stale; re-fetching mints new ones.
+        # urlMachine tokens can go stale; also a just-uploaded file may need
+        # a few seconds of server-side processing before getFile works.
         if failed:
             retry_fields = [p1c for p1c, _ in failed]
-            log.info('retrying failed fields with fresh deal fetch: %s', retry_fields)
+            log.info('waiting 5s, then retrying failed fields with fresh deal fetch: %s', retry_fields)
+            time.sleep(5)
             deal_fresh = get_deal_p1(deal_id)
             fields2, failed = build_update_payload(deal_fresh, only_fields=retry_fields)
             fields.update(fields2)
+            for p1c, _ in failed:
+                log.error('raw P1 value of failed field %s: %r', p1c, deal_fresh.get(p1c))
 
         if failed:
             for p1c, err in failed:
@@ -360,9 +385,12 @@ def do_sync(deal_id):
                         deal_id, p2_id, failed_names)
             _note(f'PARTIAL: P1 {deal_id} -> P2 {p2_id}, failed: {failed_names}',
                   completed=1, failed=1)
+            _schedule_resync(deal_id)
         else:
             log.info('=== sync OK: P1 deal %s -> P2 deal %s ===', deal_id, p2_id)
             _note(f'OK: P1 {deal_id} -> P2 {p2_id}', completed=1)
+            with _retry_lock:
+                _retry_counts.pop(deal_id, None)
     except Exception as e:
         log.exception('sync failed for deal %s: %s', deal_id, e)
         _note(f'FAIL deal {deal_id}: {e}', failed=1)
