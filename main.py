@@ -249,28 +249,45 @@ def download_file(file_meta):
     _throttle()
     r = requests.get(url, timeout=55, allow_redirects=True)
     if not r.ok:
-        log.warning('download HTTP %s; body[:300]=%r', r.status_code, r.text[:300] if r.text else '')
+        log.warning('download HTTP %s for file meta=%r; body[:300]=%r',
+                    r.status_code, {k: v for k, v in file_meta.items() if k != 'urlMachine'},
+                    r.text[:300] if r.text else '')
         r.raise_for_status()
     return extract_filename(r), base64.b64encode(r.content).decode('ascii')
 
 
-def build_update_payload(deal_p1):
+def _prepare_field_files(files, p1c):
+    """Download every file of one field. Returns [[name, b64], ...]. Raises on failure."""
+    prepared = []
+    for f in files:
+        log.info('Downloading file id=%s for field %s', f.get('id'), p1c)
+        name, b64 = download_file(f)
+        prepared.append([name, b64])
+    return prepared
+
+
+def build_update_payload(deal_p1, only_fields=None):
     """
     {p2_field_camel: [[name, b64], ...]} for each non-empty P1 file field.
     Empty P1 fields are omitted -> P2 keeps its current content there.
+    A field that fails to download doesn't kill the others — it's returned
+    in `failed` so the caller can retry it with fresh URLs.
+    Returns (fields, failed) where failed is a list of (p1_field, error_str).
     """
     fields = {}
+    failed = []
     for p1c, p2c in FILE_FIELDS_C.items():
+        if only_fields is not None and p1c not in only_fields:
+            continue
         files = deal_p1.get(p1c) or []
         if not files:
             continue
-        prepared = []
-        for f in files:
-            log.info('Downloading file id=%s for field %s', f.get('id'), p1c)
-            name, b64 = download_file(f)
-            prepared.append([name, b64])
-        fields[p2c] = prepared
-    return fields
+        try:
+            fields[p2c] = _prepare_field_files(files, p1c)
+        except Exception as e:
+            log.warning('field %s failed to download: %s', p1c, e)
+            failed.append((p1c, str(e)))
+    return fields, failed
 
 
 # ---------- Stats ----------
@@ -309,10 +326,27 @@ def do_sync(deal_id):
             _note(f'deal {deal_id}: no P2 deal for VIN={vin}', skipped_no_p2_deal=1)
             return
         log.info('matched portal 2 deal id=%s', p2_id)
-        fields = build_update_payload(deal)
+        fields, failed = build_update_payload(deal)
+
+        # Retry failed fields once with a FRESH crm.item.get:
+        # urlMachine tokens can go stale; re-fetching mints new ones.
+        if failed:
+            retry_fields = [p1c for p1c, _ in failed]
+            log.info('retrying failed fields with fresh deal fetch: %s', retry_fields)
+            deal_fresh = get_deal_p1(deal_id)
+            fields2, failed = build_update_payload(deal_fresh, only_fields=retry_fields)
+            fields.update(fields2)
+
+        if failed:
+            for p1c, err in failed:
+                log.error('field %s could NOT be synced after retry: %s', p1c, err)
+
         if not fields:
-            log.info('all file fields on portal 1 are empty, nothing to push')
-            _note(f'deal {deal_id}: all P1 file fields empty', completed=1)
+            if failed:
+                _note(f'deal {deal_id}: all non-empty fields failed to download', failed=1)
+            else:
+                log.info('all file fields on portal 1 are empty, nothing to push')
+                _note(f'deal {deal_id}: all P1 file fields empty', completed=1)
             return
         log.info('updating portal 2, fields: %s', list(fields.keys()))
         bx_p2('crm.item.update', {
@@ -320,8 +354,15 @@ def do_sync(deal_id):
             'id': p2_id,
             'fields': fields,
         })
-        log.info('=== sync OK: P1 deal %s -> P2 deal %s ===', deal_id, p2_id)
-        _note(f'OK: P1 {deal_id} -> P2 {p2_id}', completed=1)
+        if failed:
+            failed_names = [p1c for p1c, _ in failed]
+            log.warning('=== sync PARTIAL: P1 deal %s -> P2 deal %s; failed fields: %s ===',
+                        deal_id, p2_id, failed_names)
+            _note(f'PARTIAL: P1 {deal_id} -> P2 {p2_id}, failed: {failed_names}',
+                  completed=1, failed=1)
+        else:
+            log.info('=== sync OK: P1 deal %s -> P2 deal %s ===', deal_id, p2_id)
+            _note(f'OK: P1 {deal_id} -> P2 {p2_id}', completed=1)
     except Exception as e:
         log.exception('sync failed for deal %s: %s', deal_id, e)
         _note(f'FAIL deal {deal_id}: {e}', failed=1)
