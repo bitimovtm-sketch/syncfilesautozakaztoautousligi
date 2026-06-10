@@ -81,32 +81,42 @@ def _throttle():
 
 # ---------- Bitrix24 helpers ----------
 def bx(webhook, method, payload):
-    """POST to a Bitrix24 REST method with throttling and retry on rate limit."""
-    backoffs = [2, 4, 8]  # extra wait on retries
+    """POST to a Bitrix24 REST method with throttling and retry on transient errors."""
+    backoffs = [2, 4, 8]
     last_err = None
     for attempt in range(len(backoffs) + 1):
         _throttle()
+        retriable = False
         try:
             r = requests.post(f'{webhook}/{method}.json', json=payload, timeout=55)
-            if r.status_code == 503:
-                last_err = f'HTTP 503 from {method}'
+            if r.status_code in (429, 503):
+                last_err = f'{method}: HTTP {r.status_code}'
+                retriable = True
+            elif 400 <= r.status_code < 500:
+                # Permanent client error (401, 403, 404, etc.) — don't waste retries
+                log.warning('%s: HTTP %s, body[:300]=%r', method, r.status_code, r.text[:300])
+                r.raise_for_status()
             else:
                 r.raise_for_status()
                 data = r.json()
                 err = data.get('error')
                 if err in ('QUERY_LIMIT_EXCEEDED', 'OPERATION_TIME_LIMIT'):
                     last_err = f'{method}: {err}'
+                    retriable = True
                 elif err:
                     raise RuntimeError(f'{method}: {data.get("error_description") or data}')
                 else:
                     return data.get('result')
         except requests.RequestException as e:
             last_err = f'{method}: {e}'
-        if attempt < len(backoffs):
-            wait = backoffs[attempt]
-            log.warning('rate-limited or transient error (%s); retry in %ss', last_err, wait)
-            time.sleep(wait)
-    raise RuntimeError(f'gave up after retries: {last_err}')
+            # Network errors are retriable; HTTP 4xx are already handled above
+            retriable = not isinstance(e, requests.HTTPError)
+        if not retriable or attempt >= len(backoffs):
+            break
+        wait = backoffs[attempt]
+        log.warning('transient error (%s); retry in %ss', last_err, wait)
+        time.sleep(wait)
+    raise RuntimeError(last_err or f'{method}: unknown error')
 
 
 def get_deal_p1(deal_id):
