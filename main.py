@@ -14,6 +14,7 @@ Concurrency model:
 """
 import os
 import base64
+import datetime as dt
 import logging
 import queue
 import re
@@ -179,16 +180,19 @@ def do_sync(deal_id):
         vin = deal.get(VIN_P1_C)
         if not vin:
             log.warning('deal %s has no VIN, skip', deal_id)
+            _note(f'deal {deal_id} no VIN', skipped_no_vin=1)
             return
         log.info('VIN=%r', vin)
         p2_id = find_deal_p2(vin)
         if not p2_id:
             log.info('no deal on portal 2 with VIN=%r, skip', vin)
+            _note(f'deal {deal_id}: no P2 deal for VIN={vin}', skipped_no_p2_deal=1)
             return
         log.info('matched portal 2 deal id=%s', p2_id)
         fields = build_update_payload(deal)
         if not fields:
             log.info('all file fields on portal 1 are empty, nothing to push')
+            _note(f'deal {deal_id}: all P1 file fields empty', completed=1)
             return
         log.info('updating portal 2, fields: %s', list(fields.keys()))
         bx(PORTAL_2_WEBHOOK, 'crm.item.update', {
@@ -197,8 +201,10 @@ def do_sync(deal_id):
             'fields': fields,
         })
         log.info('=== sync OK: P1 deal %s -> P2 deal %s ===', deal_id, p2_id)
+        _note(f'OK: P1 {deal_id} -> P2 {p2_id}', completed=1)
     except Exception as e:
         log.exception('sync failed for deal %s: %s', deal_id, e)
+        _note(f'FAIL deal {deal_id}: {e}', failed=1)
 
 
 # ---------- Task queue ----------
@@ -209,18 +215,38 @@ _task_queue: "queue.Queue[str]" = queue.Queue()
 _pending: set = set()
 _pending_lock = threading.Lock()
 
+# Stats for /status
+_stats_lock = threading.Lock()
+_stats = {
+    'completed': 0,
+    'failed': 0,
+    'skipped_no_vin': 0,
+    'skipped_no_p2_deal': 0,
+    'last_event_at': None,
+    'last_event_msg': None,
+}
+
+
+def _note(msg, **inc):
+    """Update stats counters and last-event marker."""
+    with _stats_lock:
+        for k, v in inc.items():
+            _stats[k] = _stats.get(k, 0) + v
+        _stats['last_event_at'] = dt.datetime.utcnow().isoformat() + 'Z'
+        _stats['last_event_msg'] = msg
+
 
 def _worker():
     log.info('queue worker started')
     while True:
         deal_id = _task_queue.get()
-        # Release the dedup slot BEFORE processing, so a fresh update
-        # that arrives while we're working can re-enqueue and we won't
-        # miss the latest state.
-        with _pending_lock:
-            _pending.discard(deal_id)
         try:
+            with _pending_lock:
+                _pending.discard(deal_id)
             do_sync(deal_id)
+        except Exception:
+            log.exception('worker crashed processing deal %s', deal_id)
+            _note(f'worker crash on deal {deal_id}', failed=1)
         finally:
             _task_queue.task_done()
 
@@ -236,7 +262,8 @@ def enqueue(deal_id):
 
 
 # Spin up the worker once, on import.
-threading.Thread(target=_worker, daemon=True).start()
+_worker_thread = threading.Thread(target=_worker, daemon=True, name='sync_worker')
+_worker_thread.start()
 
 
 # ---------- HTTP ----------
@@ -244,17 +271,32 @@ app = Flask(__name__)
 
 
 def _extract_deal_id():
-    """Pull deal_id from query, form, or JSON. Handles 'DEAL_123' robot format."""
+    """
+    Pull deal_id from query, form, or JSON. Handles common Bitrix24 trigger shapes:
+    - explicit ?deal_id=123 / form `deal_id=123` (robot with URL template)
+    - JSON body {"deal_id": 123}
+    - outgoing webhook ONCRMDEAL{ADD,UPDATE,DELETE}: data[FIELDS][ID]=123
+    - workflow robot: document_id[2]=DEAL_12345
+    """
+    # 1. Direct deal_id / id in query or form
     raw = request.values.get('deal_id') or request.values.get('id')
+
+    # 2. JSON body
     if not raw:
         j = request.get_json(silent=True) or {}
         raw = j.get('deal_id') or j.get('id')
+
+    # 3. Outgoing webhook ONCRMDEALUPDATE etc.: data[FIELDS][ID]=12345
     if not raw:
-        # Bitrix24 robot might pass document_id[2]=DEAL_12345
+        raw = request.values.get('data[FIELDS][ID]')
+
+    # 4. Robot workflow: document_id[2]=DEAL_12345
+    if not raw:
         for k, v in request.form.items():
             if k.startswith('document_id') and isinstance(v, str) and v.startswith('DEAL_'):
                 raw = v[5:]
                 break
+
     if isinstance(raw, str) and raw.startswith('DEAL_'):
         raw = raw[5:]
     return str(raw).strip() if raw else None
@@ -262,14 +304,39 @@ def _extract_deal_id():
 
 @app.route('/sync', methods=['POST', 'GET'])
 def sync_route():
+    # Log shape of every inbound request so we can see how Bitrix24 is hitting us.
+    log.info(
+        'incoming /sync: method=%s args=%s form_keys=%s has_json=%s',
+        request.method,
+        dict(request.args),
+        list(request.form.keys()),
+        request.get_json(silent=True) is not None,
+    )
     deal_id = _extract_deal_id()
     if not deal_id or not deal_id.isdigit():
-        log.warning('no deal_id: args=%s form=%s', dict(request.args), dict(request.form))
+        log.warning(
+            'no deal_id extracted. args=%s form=%s json=%s',
+            dict(request.args), dict(request.form), request.get_json(silent=True),
+        )
         return jsonify({'error': 'missing or invalid deal_id'}), 400
     added = enqueue(deal_id)
     if not added:
         log.info('deal %s already pending, deduplicated', deal_id)
     return jsonify({'ok': True, 'deal_id': deal_id, 'queued': added, 'queue_size': _task_queue.qsize()}), 200
+
+
+@app.route('/status', methods=['GET'])
+def status():
+    with _pending_lock:
+        pending_list = sorted(_pending)
+    with _stats_lock:
+        s = dict(_stats)
+    return jsonify({
+        'worker_alive': _worker_thread.is_alive(),
+        'queue_size': _task_queue.qsize(),
+        'pending_deals': pending_list,
+        **s,
+    }), 200
 
 
 @app.route('/', methods=['GET'])
