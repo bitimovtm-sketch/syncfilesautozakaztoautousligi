@@ -143,28 +143,44 @@ def extract_filename(resp, fallback='file.bin'):
     return fallback
 
 
-def _normalize_file_url(url):
+def _build_download_url(url_machine):
     """
-    Workaround for Bitrix24 webhook-context urlMachine: sometimes it comes back
-    as ".../crm.controller.item.getFile/?token=..." (trailing slash, no extension)
-    and 404s. The working form is ".../crm.controller.item.getFile.json?token=...".
-    Add .json before the query string if it's missing.
+    Bitrix24's webhook-context urlMachine comes back like:
+      https://portal.bitrix24.ru/rest/USER_ID/WH_TOKEN/crm.controller.item.getFile/?token=...
+    That path 404s — crm.controller.item.getFile isn't routable via webhook prefix.
+    The working form (per docs example) is OAuth-style:
+      https://portal.bitrix24.ru/rest/crm.controller.item.getFile.json?auth=...&token=...
+    Webhook token works as the auth= parameter for these controllers.
     """
-    if not url:
-        return url
-    path, sep, query = url.partition('?')
-    path_stripped = path.rstrip('/')
-    if not path_stripped.endswith('.json'):
-        path_stripped += '.json'
-    return path_stripped + sep + query
+    if not url_machine:
+        return url_machine
+    m = re.match(r'(https?://[^/]+)/rest/(\d+)/([A-Za-z0-9]+)/(.+)$', url_machine)
+    if not m:
+        # Already OAuth-style or unrecognized — return as-is
+        return url_machine
+    origin, _user_id, wh_token, rest = m.groups()
+    path, sep, query = rest.partition('?')
+    path = path.rstrip('/')
+    if not path.endswith('.json'):
+        path += '.json'
+    new_query = f'auth={wh_token}'
+    if query:
+        new_query = f'{new_query}&{query}'
+    return f'{origin}/rest/{path}?{new_query}'
 
 
 def download(url):
     """Download file by its urlMachine. Returns (filename, base64_str)."""
     _throttle()  # file downloads also hit the portal — keep them in the same budget
-    url = _normalize_file_url(url)
-    r = requests.get(url, timeout=55, allow_redirects=True)
-    r.raise_for_status()
+    final_url = _build_download_url(url)
+    log.info('GET %s', final_url)
+    r = requests.get(final_url, timeout=55, allow_redirects=True)
+    if not r.ok:
+        log.warning(
+            'download HTTP %s; body[:400]=%r',
+            r.status_code, r.text[:400] if r.text else '',
+        )
+        r.raise_for_status()
     return extract_filename(r), base64.b64encode(r.content).decode('ascii')
 
 
