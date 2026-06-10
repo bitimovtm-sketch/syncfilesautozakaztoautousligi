@@ -1,16 +1,14 @@
 """
 Bitrix24 deal files sync: Portal 1 -> Portal 2.
 
-Trigger: HTTP POST/GET to /sync with deal_id (from Bitrix24 robot).
-Logic: read deal from P1, find matching deal on P2 by VIN, push file fields.
+Portal 1 (source, read + file download): OAuth local application.
+  Reason: CRM "File"-type fields can only be downloaded via
+  crm.controller.item.getFile, which rejects webhook auth (401).
+Portal 2 (destination, search + write): incoming webhook (works fine).
 
-Concurrency model:
-- One background worker thread drains a FIFO queue of deal_ids.
-- Pending deal_ids are deduplicated (a burst of robot calls for the same
-  deal collapses to one sync).
-- A global throttle limits ALL outgoing Bitrix24 calls (REST + file
-  downloads) to ~2/sec to stay under the platform rate limit.
-- QUERY_LIMIT_EXCEEDED / HTTP 503 trigger exponential backoff retry.
+Trigger: HTTP POST/GET to /sync with deal_id (robot / outgoing webhook on P1).
+
+Concurrency: FIFO queue + single worker + global ~2 req/sec throttle + retry.
 """
 import os
 import base64
@@ -32,7 +30,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------- Configuration ----------
-PORTAL_1_WEBHOOK = os.environ['PORTAL_1_WEBHOOK'].rstrip('/')
+# Portal 1: OAuth local application
+P1_DOMAIN = os.environ.get('P1_DOMAIN', 'autozakaz.bitrix24.ru')
+P1_CLIENT_ID = os.environ['P1_CLIENT_ID']          # local app client_id (app.xxxxx)
+P1_CLIENT_SECRET = os.environ['P1_CLIENT_SECRET']  # local app client_secret
+# Initial refresh token: filled in after first install via /install endpoint
+P1_REFRESH_TOKEN = os.environ.get('P1_REFRESH_TOKEN', '')
+
+# Portal 2: incoming webhook (write-only operations work fine via webhook)
 PORTAL_2_WEBHOOK = os.environ['PORTAL_2_WEBHOOK'].rstrip('/')
 
 ENTITY_TYPE_ID = 2  # deals
@@ -62,15 +67,12 @@ FILE_FIELDS_C = {uf_camel(k): uf_camel(v) for k, v in FILE_FIELDS.items()}
 
 
 # ---------- Rate limiting ----------
-# Bitrix24 cloud allows ~2 REST calls/sec on average.
-# A single global lock + timestamp gives us a strict cap.
 _MIN_INTERVAL = 0.5  # seconds between any two outbound Bitrix24 calls
 _rate_lock = threading.Lock()
 _last_call_at = 0.0
 
 
 def _throttle():
-    """Block until at least _MIN_INTERVAL has passed since the last call."""
     global _last_call_at
     with _rate_lock:
         wait = _MIN_INTERVAL - (time.monotonic() - _last_call_at)
@@ -79,57 +81,129 @@ def _throttle():
         _last_call_at = time.monotonic()
 
 
-# ---------- Bitrix24 helpers ----------
-def bx(webhook, method, payload):
-    """POST to a Bitrix24 REST method with throttling and retry on transient errors."""
+# ---------- OAuth token manager (Portal 1) ----------
+_token_lock = threading.Lock()
+_token = {
+    'access_token': None,
+    'refresh_token': P1_REFRESH_TOKEN or None,
+    'expires_at': 0.0,  # monotonic deadline
+}
+
+
+def _refresh_p1_token():
+    """Exchange refresh_token for a fresh access_token. Must hold _token_lock."""
+    rt = _token['refresh_token']
+    if not rt:
+        raise RuntimeError(
+            'No P1 refresh token. Install the local app (it will hit /install), '
+            'or set P1_REFRESH_TOKEN env var.'
+        )
+    _throttle()
+    r = requests.get(
+        'https://oauth.bitrix.info/oauth/token/',
+        params={
+            'grant_type': 'refresh_token',
+            'client_id': P1_CLIENT_ID,
+            'client_secret': P1_CLIENT_SECRET,
+            'refresh_token': rt,
+        },
+        timeout=30,
+    )
+    data = r.json()
+    if 'access_token' not in data:
+        raise RuntimeError(f'OAuth refresh failed: {data}')
+    _token['access_token'] = data['access_token']
+    _token['refresh_token'] = data.get('refresh_token') or rt
+    # expires_in is usually 3600; renew 5 min early
+    _token['expires_at'] = time.monotonic() + int(data.get('expires_in', 3600)) - 300
+    log.info('P1 access token refreshed, valid ~%s min', int(data.get('expires_in', 3600)) / 60)
+    log.info('P1 NEW refresh_token (save to Railway env P1_REFRESH_TOKEN to survive restarts): %s',
+             _token['refresh_token'])
+
+
+def get_p1_token():
+    """Return a valid access token for portal 1, refreshing if needed."""
+    with _token_lock:
+        if not _token['access_token'] or time.monotonic() >= _token['expires_at']:
+            _refresh_p1_token()
+        return _token['access_token']
+
+
+def set_p1_tokens(access_token, refresh_token, expires_in=3600):
+    """Store tokens received from app installation (/install)."""
+    with _token_lock:
+        _token['access_token'] = access_token
+        _token['refresh_token'] = refresh_token
+        _token['expires_at'] = time.monotonic() + int(expires_in) - 300
+
+
+# ---------- Bitrix24 REST helpers ----------
+def _bx_request(post_url, payload):
+    """Single POST with retry on transient errors. Returns parsed result or raises."""
     backoffs = [2, 4, 8]
     last_err = None
     for attempt in range(len(backoffs) + 1):
         _throttle()
         retriable = False
         try:
-            r = requests.post(f'{webhook}/{method}.json', json=payload, timeout=55)
+            r = requests.post(post_url, json=payload, timeout=55)
             if r.status_code in (429, 503):
-                last_err = f'{method}: HTTP {r.status_code}'
+                last_err = f'HTTP {r.status_code}'
                 retriable = True
-            elif 400 <= r.status_code < 500:
-                # Permanent client error (401, 403, 404, etc.) — don't waste retries
-                log.warning('%s: HTTP %s, body[:300]=%r', method, r.status_code, r.text[:300])
-                r.raise_for_status()
             else:
-                r.raise_for_status()
                 data = r.json()
                 err = data.get('error')
                 if err in ('QUERY_LIMIT_EXCEEDED', 'OPERATION_TIME_LIMIT'):
-                    last_err = f'{method}: {err}'
+                    last_err = err
                     retriable = True
                 elif err:
-                    raise RuntimeError(f'{method}: {data.get("error_description") or data}')
+                    raise RuntimeError(f'{data.get("error_description") or data}')
                 else:
                     return data.get('result')
-        except requests.RequestException as e:
-            last_err = f'{method}: {e}'
-            # Network errors are retriable; HTTP 4xx are already handled above
-            retriable = not isinstance(e, requests.HTTPError)
+        except (requests.RequestException, ValueError) as e:
+            last_err = str(e)
+            retriable = True
         if not retriable or attempt >= len(backoffs):
             break
         wait = backoffs[attempt]
         log.warning('transient error (%s); retry in %ss', last_err, wait)
         time.sleep(wait)
-    raise RuntimeError(last_err or f'{method}: unknown error')
+    raise RuntimeError(last_err or 'unknown error')
+
+
+def bx_p1(method, payload):
+    """Call portal 1 REST method with OAuth. Retries once on expired_token."""
+    token = get_p1_token()
+    url = f'https://{P1_DOMAIN}/rest/{method}.json'
+    try:
+        return _bx_request(url, {**payload, 'auth': token})
+    except RuntimeError as e:
+        if 'expired_token' in str(e).lower() or 'invalid_token' in str(e).lower():
+            log.info('P1 token rejected, forcing refresh and retrying once')
+            with _token_lock:
+                _token['access_token'] = None
+            token = get_p1_token()
+            return _bx_request(url, {**payload, 'auth': token})
+        raise RuntimeError(f'{method}: {e}')
+
+
+def bx_p2(method, payload):
+    """Call portal 2 REST method via incoming webhook."""
+    try:
+        return _bx_request(f'{PORTAL_2_WEBHOOK}/{method}.json', payload)
+    except RuntimeError as e:
+        raise RuntimeError(f'{method}: {e}')
 
 
 def get_deal_p1(deal_id):
-    """Fetch deal from portal 1 (returns dict)."""
-    return bx(PORTAL_1_WEBHOOK, 'crm.item.get', {
+    return bx_p1('crm.item.get', {
         'entityTypeId': ENTITY_TYPE_ID,
         'id': int(deal_id),
     })['item']
 
 
 def find_deal_p2(vin):
-    """Find first deal on portal 2 by VIN, or None."""
-    res = bx(PORTAL_2_WEBHOOK, 'crm.item.list', {
+    res = bx_p2('crm.item.list', {
         'entityTypeId': ENTITY_TYPE_ID,
         'filter': {VIN_P2_C: vin},
         'select': ['id'],
@@ -138,8 +212,8 @@ def find_deal_p2(vin):
     return items[0]['id'] if items else None
 
 
+# ---------- File download (Portal 1, OAuth context) ----------
 def extract_filename(resp, fallback='file.bin'):
-    """Pull filename out of Content-Disposition header."""
     cd = resp.headers.get('Content-Disposition', '')
     m = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.IGNORECASE)
     if m:
@@ -153,64 +227,37 @@ def extract_filename(resp, fallback='file.bin'):
     return fallback
 
 
-def _try_disk_download(webhook, file_id):
+def download_file(file_meta):
     """
-    Try to get the file via disk.file.get + DOWNLOAD_URL.
-    Returns (filename, base64_str) on success, None if file isn't on the disk.
+    Download a file from a P1 CRM file field.
+    In OAuth context urlMachine comes as:
+      https://{domain}/rest/crm.controller.item.getFile.json?auth=...&token=...
+    The embedded auth may belong to a stale token, so we swap in our current one.
     """
-    try:
-        info = bx(webhook, 'disk.file.get', {'id': int(file_id)})
-    except RuntimeError as e:
-        log.info('disk.file.get failed for id=%s: %s', file_id, e)
-        return None
-    if not info or not isinstance(info, dict):
-        return None
-    dl_url = info.get('DOWNLOAD_URL') or info.get('downloadUrl')
-    if not dl_url:
-        log.info('disk.file.get returned no DOWNLOAD_URL for id=%s; keys=%s', file_id, list(info.keys()))
-        return None
-    name = info.get('NAME') or info.get('name') or f'file_{file_id}.bin'
-    log.info('disk.file.get OK for id=%s, name=%s, downloading...', file_id, name)
+    url = file_meta.get('urlMachine') or file_meta.get('url')
+    if not url:
+        raise RuntimeError(f'file {file_meta.get("id")}: no download URL in response')
+
+    # Replace/insert auth= with our current access token
+    token = get_p1_token()
+    if 'auth=' in url:
+        url = re.sub(r'auth=[^&]*', f'auth={token}', url)
+    else:
+        sep = '&' if '?' in url else '?'
+        url = f'{url}{sep}auth={token}'
+
     _throttle()
-    r = requests.get(dl_url, timeout=55, allow_redirects=True)
+    r = requests.get(url, timeout=55, allow_redirects=True)
     if not r.ok:
-        log.warning('disk DOWNLOAD_URL HTTP %s; body[:300]=%r', r.status_code, r.text[:300] if r.text else '')
-        return None
-    return name, base64.b64encode(r.content).decode('ascii')
-
-
-def download_file(p1_webhook, file_meta):
-    """
-    Download a single file. file_meta is the dict Bitrix returned: {id, url, urlMachine}.
-    Tries disk.file.get first (works via webhook), falls back to urlMachine GET.
-    Raises on total failure so the calling code knows this field couldn't be synced.
-    """
-    file_id = file_meta.get('id')
-
-    # Primary path: disk.file.get works fine via webhook
-    if file_id:
-        result = _try_disk_download(p1_webhook, file_id)
-        if result is not None:
-            return result
-
-    # Fallback: original urlMachine (will probably 404/401 in webhook context, but log it)
-    url_machine = file_meta.get('urlMachine') or file_meta.get('url')
-    if not url_machine:
-        raise RuntimeError(f'no download URL and disk.file.get failed for file {file_id}')
-    log.info('disk path failed, falling back to urlMachine: %s', url_machine)
-    _throttle()
-    r = requests.get(url_machine, timeout=55, allow_redirects=True)
-    if not r.ok:
-        log.warning('urlMachine fallback HTTP %s; body[:300]=%r', r.status_code, r.text[:300] if r.text else '')
+        log.warning('download HTTP %s; body[:300]=%r', r.status_code, r.text[:300] if r.text else '')
         r.raise_for_status()
     return extract_filename(r), base64.b64encode(r.content).decode('ascii')
 
 
 def build_update_payload(deal_p1):
     """
-    For each file field with content on portal 1, download files and prep base64 payload.
-    Returns {p2_field_camel: [[name, b64], ...]} — empty fields on P1 are omitted,
-    so portal 2 keeps whatever it already has there.
+    {p2_field_camel: [[name, b64], ...]} for each non-empty P1 file field.
+    Empty P1 fields are omitted -> P2 keeps its current content there.
     """
     fields = {}
     for p1c, p2c in FILE_FIELDS_C.items():
@@ -219,15 +266,34 @@ def build_update_payload(deal_p1):
             continue
         prepared = []
         for f in files:
-            log.info('Resolving file id=%s for field %s', f.get('id'), p1c)
-            name, b64 = download_file(PORTAL_1_WEBHOOK, f)
+            log.info('Downloading file id=%s for field %s', f.get('id'), p1c)
+            name, b64 = download_file(f)
             prepared.append([name, b64])
         fields[p2c] = prepared
     return fields
 
 
+# ---------- Stats ----------
+_stats_lock = threading.Lock()
+_stats = {
+    'completed': 0,
+    'failed': 0,
+    'skipped_no_vin': 0,
+    'skipped_no_p2_deal': 0,
+    'last_event_at': None,
+    'last_event_msg': None,
+}
+
+
+def _note(msg, **inc):
+    with _stats_lock:
+        for k, v in inc.items():
+            _stats[k] = _stats.get(k, 0) + v
+        _stats['last_event_at'] = dt.datetime.utcnow().isoformat() + 'Z'
+        _stats['last_event_msg'] = msg
+
+
 def do_sync(deal_id):
-    """Main routine; logs and swallows all exceptions."""
     try:
         log.info('=== sync start P1 deal=%s ===', deal_id)
         deal = get_deal_p1(deal_id)
@@ -249,7 +315,7 @@ def do_sync(deal_id):
             _note(f'deal {deal_id}: all P1 file fields empty', completed=1)
             return
         log.info('updating portal 2, fields: %s', list(fields.keys()))
-        bx(PORTAL_2_WEBHOOK, 'crm.item.update', {
+        bx_p2('crm.item.update', {
             'entityTypeId': ENTITY_TYPE_ID,
             'id': p2_id,
             'fields': fields,
@@ -262,32 +328,9 @@ def do_sync(deal_id):
 
 
 # ---------- Task queue ----------
-# Single worker drains the queue serially. Throttling above already
-# enforces the rate limit, but a single worker also prevents bursts
-# from interleaving and makes logs readable.
 _task_queue: "queue.Queue[str]" = queue.Queue()
 _pending: set = set()
 _pending_lock = threading.Lock()
-
-# Stats for /status
-_stats_lock = threading.Lock()
-_stats = {
-    'completed': 0,
-    'failed': 0,
-    'skipped_no_vin': 0,
-    'skipped_no_p2_deal': 0,
-    'last_event_at': None,
-    'last_event_msg': None,
-}
-
-
-def _note(msg, **inc):
-    """Update stats counters and last-event marker."""
-    with _stats_lock:
-        for k, v in inc.items():
-            _stats[k] = _stats.get(k, 0) + v
-        _stats['last_event_at'] = dt.datetime.utcnow().isoformat() + 'Z'
-        _stats['last_event_msg'] = msg
 
 
 def _worker():
@@ -306,7 +349,6 @@ def _worker():
 
 
 def enqueue(deal_id):
-    """Add deal to queue unless it's already pending. Returns True if added."""
     with _pending_lock:
         if deal_id in _pending:
             return False
@@ -315,7 +357,6 @@ def enqueue(deal_id):
     return True
 
 
-# Spin up the worker once, on import.
 _worker_thread = threading.Thread(target=_worker, daemon=True, name='sync_worker')
 _worker_thread.start()
 
@@ -325,32 +366,17 @@ app = Flask(__name__)
 
 
 def _extract_deal_id():
-    """
-    Pull deal_id from query, form, or JSON. Handles common Bitrix24 trigger shapes:
-    - explicit ?deal_id=123 / form `deal_id=123` (robot with URL template)
-    - JSON body {"deal_id": 123}
-    - outgoing webhook ONCRMDEAL{ADD,UPDATE,DELETE}: data[FIELDS][ID]=123
-    - workflow robot: document_id[2]=DEAL_12345
-    """
-    # 1. Direct deal_id / id in query or form
     raw = request.values.get('deal_id') or request.values.get('id')
-
-    # 2. JSON body
     if not raw:
         j = request.get_json(silent=True) or {}
         raw = j.get('deal_id') or j.get('id')
-
-    # 3. Outgoing webhook ONCRMDEALUPDATE etc.: data[FIELDS][ID]=12345
     if not raw:
         raw = request.values.get('data[FIELDS][ID]')
-
-    # 4. Robot workflow: document_id[2]=DEAL_12345
     if not raw:
         for k, v in request.form.items():
             if k.startswith('document_id') and isinstance(v, str) and v.startswith('DEAL_'):
                 raw = v[5:]
                 break
-
     if isinstance(raw, str) and raw.startswith('DEAL_'):
         raw = raw[5:]
     return str(raw).strip() if raw else None
@@ -358,25 +384,50 @@ def _extract_deal_id():
 
 @app.route('/sync', methods=['POST', 'GET'])
 def sync_route():
-    # Log shape of every inbound request so we can see how Bitrix24 is hitting us.
     log.info(
         'incoming /sync: method=%s args=%s form_keys=%s has_json=%s',
-        request.method,
-        dict(request.args),
-        list(request.form.keys()),
+        request.method, dict(request.args), list(request.form.keys()),
         request.get_json(silent=True) is not None,
     )
     deal_id = _extract_deal_id()
     if not deal_id or not deal_id.isdigit():
-        log.warning(
-            'no deal_id extracted. args=%s form=%s json=%s',
-            dict(request.args), dict(request.form), request.get_json(silent=True),
-        )
+        log.warning('no deal_id extracted. args=%s form=%s json=%s',
+                    dict(request.args), dict(request.form), request.get_json(silent=True))
         return jsonify({'error': 'missing or invalid deal_id'}), 400
     added = enqueue(deal_id)
     if not added:
         log.info('deal %s already pending, deduplicated', deal_id)
-    return jsonify({'ok': True, 'deal_id': deal_id, 'queued': added, 'queue_size': _task_queue.qsize()}), 200
+    return jsonify({'ok': True, 'deal_id': deal_id, 'queued': added,
+                    'queue_size': _task_queue.qsize()}), 200
+
+
+@app.route('/install', methods=['POST', 'GET'])
+def install():
+    """
+    Installation handler for the P1 local application.
+    Bitrix24 POSTs AUTH_ID (access token) and REFRESH_ID (refresh token) here
+    when the app is installed or re-installed.
+    """
+    auth_id = request.values.get('AUTH_ID')
+    refresh_id = request.values.get('REFRESH_ID')
+    expires_in = request.values.get('AUTH_EXPIRES', 3600)
+    log.info('/install hit: has AUTH_ID=%s has REFRESH_ID=%s form_keys=%s',
+             bool(auth_id), bool(refresh_id), list(request.form.keys()))
+    if auth_id and refresh_id:
+        set_p1_tokens(auth_id, refresh_id, expires_in)
+        log.info('P1 tokens stored from /install.')
+        log.info('SAVE THIS refresh_token to Railway env P1_REFRESH_TOKEN: %s', refresh_id)
+        # Minimal page + BX24.installFinish so Bitrix marks installation complete
+        return (
+            '<!DOCTYPE html><html><head>'
+            '<script src="//api.bitrix24.com/api/v1/"></script>'
+            '<script>BX24.init(function(){ BX24.installFinish(); });</script>'
+            '</head><body>App installed. Tokens captured — check Railway logs '
+            'and save P1_REFRESH_TOKEN.</body></html>',
+            200,
+            {'Content-Type': 'text/html'},
+        )
+    return jsonify({'ok': True, 'note': 'no tokens in request'}), 200
 
 
 @app.route('/status', methods=['GET'])
@@ -385,10 +436,14 @@ def status():
         pending_list = sorted(_pending)
     with _stats_lock:
         s = dict(_stats)
+    with _token_lock:
+        has_access = bool(_token['access_token'])
+        has_refresh = bool(_token['refresh_token'])
     return jsonify({
         'worker_alive': _worker_thread.is_alive(),
         'queue_size': _task_queue.qsize(),
         'pending_deals': pending_list,
+        'p1_oauth': {'has_access_token': has_access, 'has_refresh_token': has_refresh},
         **s,
     }), 200
 
